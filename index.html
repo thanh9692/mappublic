@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Warehouse Map Visualization</title>
+  <meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no">
+  <link href="https://api.mapbox.com/mapbox-gl-js/v3.10.0/mapbox-gl.css" rel="stylesheet">
+  <script src="https://api.mapbox.com/mapbox-gl-js/v3.10.0/mapbox-gl.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
+  <style>
+    body { margin: 0; padding: 0; font-family: sans-serif; }
+    #map { position: absolute; top: 0; bottom: 0; width: 100%; }
+
+    #filterContainer {
+      position: absolute;
+      bottom: 50px;
+      right: 10px;
+      background: white;
+      border-radius: 6px;
+      padding: 10px;
+      max-height: 300px;
+      overflow-y: auto;
+      z-index: 2;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+    }
+
+    #toggleFilterBtn,
+    #toggleVolumeBtn {
+      position: absolute;
+      z-index: 3;
+      background: white;
+      border: 1px solid #ccc;
+      padding: 5px 10px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-weight: bold;
+    }
+
+    #toggleFilterBtn {
+      bottom: 10px;
+      right: 10px;
+    }
+
+    #toggleVolumeBtn {
+      top: 10px;
+      left: 10px; /* place it next to volumeLegend panel */
+    }
+
+    #volumeLegend {
+      position: absolute;
+      top: 40px;
+      left: 10px;
+      background: white;
+      padding: 10px 14px;
+      border-radius: 6px;
+      max-height: 90vh;
+      overflow-y: auto;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+      z-index: 2;
+      font-family: sans-serif;
+      font-size: 14px;
+      line-height: 1.4;
+      min-width: 280px;
+    }
+
+    .volume-item {
+      display: flex;
+      align-items: center;
+      justify-content: flex-start;
+      gap: 10px;
+      margin-bottom: 4px;
+    }
+
+    .volume-label {
+      flex: 1;
+      text-align: left;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .volume-color {
+      width: 16px;
+      height: 16px;
+      min-width: 16px;
+      border-radius: 4px;
+      border: 1px solid #888;
+    }
+
+    .volume-value {
+      font-weight: bold;
+      font-family: monospace, Courier, 'Courier New';
+      text-align: left;
+      min-width: 80px;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <!-- 🔘 Toggle Filter Button -->
+  <button id="toggleFilterBtn">Hide Filters</button>
+
+  <!-- ✅ Owner Filter Panel -->
+  <div id="filterContainer">
+    <strong>Filter by Owner:</strong><br>
+    <div id="ownerFilters"></div>
+    <button onclick="selectAllOwners()">Select All</button>
+    <button onclick="clearAllOwners()">Clear All</button>
+  </div>
+
+  <!-- 🔘 Toggle Owner Volume Button -->
+  <button id="toggleVolumeBtn">Hide Owner Data</button>
+
+  <!-- 📊 Volume Bar Chart -->
+  <div id="volumeLegend">
+    <strong>Total Volume by Owner</strong>
+    <div id="volumeBars"></div>
+  </div>
+
+  <script>
+    mapboxgl.accessToken = 'pk.eyJ1Ijoic3RpbGF2ZSIsImEiOiJjbTgzd2wyeGoxdnJqMnJxOGM3ZGw0MnhnIn0._rjyOX5DKYntKmpzn2Z-Cw';
+
+    const map = new mapboxgl.Map({
+      container: 'map',
+      style: 'mapbox://styles/mapbox/streets-v12',
+      center: [105.819, 21.001],
+      zoom: 14,
+      pitch: 0
+    });
+
+    map.addControl(new mapboxgl.NavigationControl());
+    map.scrollZoom.enable();
+
+    map.on('style.load', () => map.setFog({}));
+
+    const csvUrl = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRZxl_-6Q5F8OXn-62996Muf8TGZjd4O5J_nfKAqy7nSn6JnLBrd1OzGdAl609F4nnbZDblgRyxIWA0/pub?gid=0&single=true&output=csv';
+
+    const allMarkers = [];
+    const allHullLayers = [];
+
+    function parseCSV(text) {
+      const rows = text.trim().split('\n');
+      const headers = rows[0].split(',').map(h => h.trim().toLowerCase());
+      return rows.slice(1).map(row => {
+        const values = row.split(',').map(cell => cell.trim());
+        const item = {};
+        headers.forEach((h, i) => item[h] = values[i]);
+        return item;
+      });
+    }
+
+    function getColorMap(owners) {
+      const colors = [
+        '#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231',
+        '#911eb4', '#46f0f0', '#f032e6', '#bcf60c', '#fabebe',
+        '#008080', '#e6beff', '#9a6324', '#fffac8', '#800000',
+        '#aaffc3', '#ffd8b1', '#000075', '#808000', '#a9a9a9'
+      ];
+      const colorMap = {};
+      Array.from(new Set(owners)).forEach((owner, idx) => {
+        colorMap[owner] = colors[idx % colors.length];
+      });
+      return colorMap;
+    }
+
+    let colorMap = {};
+    let ownerPointsMap = {};
+
+    fetch(csvUrl)
+      .then(response => response.text())
+      .then(csvText => {
+        const data = parseCSV(csvText);
+        const owners = data.map(item => item.owner);
+        colorMap = getColorMap(owners);
+        ownerPointsMap = {};
+
+        data.forEach(item => {
+          const lat = parseFloat(item.lat);
+          const lon = parseFloat(item.lon);
+          const owner = item.owner;
+
+          if (!ownerPointsMap[owner]) {
+            ownerPointsMap[owner] = { points: [], data: [] };
+          }
+
+          ownerPointsMap[owner].points.push(turf.point([lon, lat]));
+          ownerPointsMap[owner].data.push(item);
+        });
+
+        createOwnerFilter(Object.keys(ownerPointsMap));
+        createVolumeChart(data);
+      });
+
+    function createOwnerFilter(owners) {
+      const container = document.getElementById('ownerFilters');
+      owners.forEach(owner => {
+        const div = document.createElement('div');
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.value = owner;
+        checkbox.checked = true;
+        checkbox.onchange = updateMap;
+
+        const label = document.createElement('label');
+        label.style.marginLeft = '5px';
+        label.innerText = owner;
+
+        div.appendChild(checkbox);
+        div.appendChild(label);
+        container.appendChild(div);
+      });
+      updateMap();
+    }
+
+    function updateMap() {
+      allMarkers.forEach(m => m.remove());
+      allMarkers.length = 0;
+
+      allHullLayers.forEach(({ sourceId, fillId, outlineId }) => {
+        if (map.getLayer(fillId)) map.removeLayer(fillId);
+        if (map.getLayer(outlineId)) map.removeLayer(outlineId);
+        if (map.getSource(sourceId)) map.removeSource(sourceId);
+      });
+      allHullLayers.length = 0;
+
+      const checkboxes = document.querySelectorAll('#ownerFilters input[type=checkbox]');
+      const activeOwners = Array.from(checkboxes).filter(cb => cb.checked).map(cb => cb.value);
+
+      activeOwners.forEach(owner => {
+        const ownerData = ownerPointsMap[owner];
+        if (!ownerData) return;
+
+        ownerData.data.forEach(item => {
+          const el = document.createElement('div');
+          el.style.backgroundColor = colorMap[owner];
+          el.style.width = '8px';
+          el.style.height = '8px';
+          el.style.borderRadius = '50%';
+          el.style.border = '2px solid white';
+          el.style.boxShadow = '0 0 3px rgba(0,0,0,0.5)';
+
+          const marker = new mapboxgl.Marker(el)
+            .setLngLat([parseFloat(item.lon), parseFloat(item.lat)])
+            .setPopup(new mapboxgl.Popup().setHTML(`<strong>${item.address}</strong><br>Owner: ${item.owner}`))
+            .addTo(map);
+          allMarkers.push(marker);
+        });
+
+        const featureCollection = turf.featureCollection(ownerData.points);
+        const hull = turf.convex(featureCollection);
+        if (hull) {
+          const sourceId = `hull-${owner}`;
+          const fillId = `hull-fill-${owner}`;
+          const outlineId = `hull-outline-${owner}`;
+
+          map.addSource(sourceId, { type: 'geojson', data: hull });
+
+          map.addLayer({
+            id: fillId,
+            type: 'fill',
+            source: sourceId,
+            paint: {
+              'fill-color': colorMap[owner],
+              'fill-opacity': 0.2
+            }
+          });
+
+          map.addLayer({
+            id: outlineId,
+            type: 'line',
+            source: sourceId,
+            paint: {
+              'line-color': colorMap[owner],
+              'line-width': 2
+            }
+          });
+
+          allHullLayers.push({ sourceId, fillId, outlineId });
+        }
+      });
+    }
+
+    function selectAllOwners() {
+      document.querySelectorAll('#ownerFilters input[type=checkbox]').forEach(cb => cb.checked = true);
+      updateMap();
+    }
+
+    function clearAllOwners() {
+      document.querySelectorAll('#ownerFilters input[type=checkbox]').forEach(cb => cb.checked = false);
+      updateMap();
+    }
+
+    // 🔘 Toggle Filter Panel
+    const toggleBtn = document.getElementById('toggleFilterBtn');
+    const filterContainer = document.getElementById('filterContainer');
+    toggleBtn.addEventListener('click', () => {
+      if (filterContainer.style.display === 'none') {
+        filterContainer.style.display = 'block';
+        toggleBtn.textContent = 'Hide Filters';
+      } else {
+        filterContainer.style.display = 'none';
+        toggleBtn.textContent = 'Show Filters';
+      }
+    });
+
+    // 🔘 Toggle Volume Chart Panel
+    const volumeBtn = document.getElementById('toggleVolumeBtn');
+    const volumePanel = document.getElementById('volumeLegend');
+    volumeBtn.addEventListener('click', () => {
+      if (volumePanel.style.display === 'none') {
+        volumePanel.style.display = 'block';
+        volumeBtn.textContent = 'Hide Owner Data';
+      } else {
+        volumePanel.style.display = 'none';
+        volumeBtn.textContent = 'Show Owner Data';
+      }
+    });
+
+    function createVolumeChart(data) {
+      const volumeTotals = {};
+      data.forEach(item => {
+        const owner = item.owner;
+        const volume = parseFloat(item.volume?.replace(/,/g, '')) || 0;
+        if (!volumeTotals[owner]) volumeTotals[owner] = 0;
+        volumeTotals[owner] += volume;
+      });
+
+      const sortedOwners = Object.keys(volumeTotals).sort((a, b) => volumeTotals[b] - volumeTotals[a]);
+
+      const volumeBars = document.getElementById('volumeBars');
+      volumeBars.innerHTML = '';
+
+      sortedOwners.forEach(owner => {
+        const div = document.createElement('div');
+        div.className = 'volume-item';
+
+        const label = document.createElement('div');
+        label.className = 'volume-label';
+        label.textContent = owner;
+
+        const colorBox = document.createElement('div');
+        colorBox.className = 'volume-color';
+        colorBox.style.backgroundColor = colorMap[owner];
+
+        const value = document.createElement('div');
+        value.className = 'volume-value';
+        value.textContent = volumeTotals[owner].toLocaleString();
+
+        div.appendChild(label);
+        div.appendChild(colorBox);
+        div.appendChild(value);
+        volumeBars.appendChild(div);
+      });
+    }
+
+    map.on('load', function () {
+      map.addSource('my-vector-tileset', {
+        type: 'vector',
+        url: 'mapbox://stilave.avqp4gqm'
+      });
+
+      map.addLayer({
+        id: 'tileset-layer',
+        type: 'line',
+        source: 'my-vector-tileset',
+        'source-layer': 'gadm41_VNM_2-79mpd4',
+        paint: {
+          'line-color': '#ff0000',
+          'line-opacity': 0.8,
+          'line-width': 2,
+          'line-dasharray': [2, 4]
+        }
+      });
+    });
+  </script>
+</body>
+</html>
